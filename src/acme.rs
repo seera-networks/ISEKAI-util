@@ -213,7 +213,10 @@ pub async fn ensure_certificate(config: AcmeConfig) -> anyhow::Result<()> {
 
     let openssl_cert = X509::from_pem(cert_chain_pem.as_bytes())?;
     let openssl_pkey = PKey::private_key_from_pem(private_key_pem.as_bytes())?;
-    let pfx = Pkcs12::builder().pkey(&openssl_pkey).cert(&openssl_cert).build2("")?;
+    let pfx = Pkcs12::builder()
+        .pkey(&openssl_pkey)
+        .cert(&openssl_cert)
+        .build2("")?;
     let pfx_der = pfx.to_der()?;
 
     if let Some(parent) = FsPath::new(&config.key_path).parent()
@@ -348,17 +351,16 @@ async fn ensure_certificate_dns01(
             tokio::time::sleep(DNS_PROPAGATION_RETRY_INTERVAL).await;
         }
         if !propagated {
-            if let Some(record_id) = record_id {
-                if let Err(err) = client
+            if let Some(record_id) = record_id
+                && let Err(err) = client
                     .delete(format!(
                         "https://api.cloudflare.com/client/v4/zones/{cloudflare_zone_id}/dns_records/{record_id}"
                     ))
                     .bearer_auth(cloudflare_api_token)
                     .send()
                     .await
-                {
-                    tracing::warn!("failed to delete Cloudflare TXT challenge record: {err}");
-                }
+            {
+                tracing::warn!("failed to delete Cloudflare TXT challenge record: {err}");
             }
             bail!(
                 "dns challenge did not propagate in time for {}",
@@ -368,17 +370,16 @@ async fn ensure_certificate_dns01(
 
         challenge.set_ready().await?;
 
-        if let Some(record_id) = record_id {
-            if let Err(err) = client
+        if let Some(record_id) = record_id
+            && let Err(err) = client
                 .delete(format!(
                     "https://api.cloudflare.com/client/v4/zones/{cloudflare_zone_id}/dns_records/{record_id}"
                 ))
                 .bearer_auth(cloudflare_api_token)
                 .send()
                 .await
-            {
-                tracing::warn!("failed to delete Cloudflare TXT challenge record: {err}");
-            }
+        {
+            tracing::warn!("failed to delete Cloudflare TXT challenge record: {err}");
         }
     }
 
