@@ -149,16 +149,19 @@ pub async fn ensure_certificate(config: AcmeConfig) -> anyhow::Result<()> {
                 && !parent.as_os_str().is_empty()
                 && !parent.exists()
             {
-                std::fs::create_dir_all(parent).with_context(|| {
+                crate::secure_fs::create_secret_dir(parent).with_context(|| {
                     format!(
                         "failed to create ACME credential directory {}",
                         parent.display()
                     )
                 })?;
             }
-            std::fs::write(credential_path, serde_json::to_string(&credentials)?).with_context(
-                || format!("failed to write ACME credentials at {credential_path}"),
-            )?;
+            // Account credentials contain the ACME account private key; they
+            // must not be world-readable.
+            crate::secure_fs::write_secret(credential_path, serde_json::to_string(&credentials)?)
+                .with_context(
+                    || format!("failed to write ACME credentials at {credential_path}"),
+                )?;
             account
         }
     } else {
@@ -223,7 +226,7 @@ pub async fn ensure_certificate(config: AcmeConfig) -> anyhow::Result<()> {
         && !parent.as_os_str().is_empty()
         && !parent.exists()
     {
-        std::fs::create_dir_all(parent)
+        crate::secure_fs::create_secret_dir(parent)
             .with_context(|| format!("failed to create key directory {}", parent.display()))?;
     }
     if let Some(parent) = FsPath::new(&config.cert_path).parent()
@@ -237,15 +240,17 @@ pub async fn ensure_certificate(config: AcmeConfig) -> anyhow::Result<()> {
         && !parent.as_os_str().is_empty()
         && !parent.exists()
     {
-        std::fs::create_dir_all(parent)
+        crate::secure_fs::create_secret_dir(parent)
             .with_context(|| format!("failed to create PKCS#12 directory {}", parent.display()))?;
     }
 
-    std::fs::write(&config.key_path, private_key_pem)
+    // The private key and the PKCS#12 bundle (which embeds the key) must be
+    // owner-readable only; the certificate chain is public material.
+    crate::secure_fs::write_secret(&config.key_path, private_key_pem)
         .with_context(|| format!("failed to write key PEM {}", config.key_path))?;
     std::fs::write(&config.cert_path, cert_chain_pem)
         .with_context(|| format!("failed to write cert PEM {}", config.cert_path))?;
-    std::fs::write(&config.pkcs12_path, pfx_der)
+    crate::secure_fs::write_secret(&config.pkcs12_path, pfx_der)
         .with_context(|| format!("failed to write PKCS#12 {}", config.pkcs12_path))?;
     tracing::info!("ACME certificate written to {}", config.cert_path);
     Ok(())
