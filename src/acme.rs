@@ -159,9 +159,7 @@ pub async fn ensure_certificate(config: AcmeConfig) -> anyhow::Result<()> {
             // Account credentials contain the ACME account private key; they
             // must not be world-readable.
             crate::secure_fs::write_secret(credential_path, serde_json::to_string(&credentials)?)
-                .with_context(
-                    || format!("failed to write ACME credentials at {credential_path}"),
-                )?;
+                .with_context(|| format!("failed to write ACME credentials at {credential_path}"))?;
             account
         }
     } else {

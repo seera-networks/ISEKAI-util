@@ -2,23 +2,30 @@
 name = "isekai-util"
 version = "0.1.0"
 edition = "2024"
+description = "Shared helpers for ISEKAI Link: ACME certificate issuance, DNS, hardened file I/O and P2P Connect PoP primitives."
+repository = "https://github.com/seera-networks/ISEKAI-util"
 
+# Versions are written out here rather than inherited from a workspace: this
+# crate is consumed as a git dependency by ISEKAI-link-server, so it has to
+# resolve on its own. `instant-acme` stays a git dependency pinned to an exact
+# rev, matching the consumer's `deny.toml` allow-git policy.
 [dependencies]
-anyhow = { workspace = true }
-axum = { workspace = true, features = ["http1", "tokio"] }
-base64 = { workspace = true }
-hickory-net = { workspace = true }
-hickory-resolver = { workspace = true }
-instant-acme = { workspace = true }
-openssl = { workspace = true }
-p256 = { workspace = true }
-reqwest = { workspace = true }
-rustls = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
-tokio-util = { workspace = true }
-tracing = { workspace = true }
-x509-parser = { workspace = true }
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+base64 = "0.22.1"
+hickory-net = "0.26.1"
+hickory-resolver = "0.26.1"
+instant-acme = { git = "https://github.com/djc/instant-acme.git", rev = "fad75fa7f1f4bf6a295fd2cea13078bab85378a8" }
+openssl = { version = "0.10", default-features = false }
+# ECDSA P-256 / JWK for Endpoint PoP verification (P2P Connect).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "jwk", "std"] }
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
+rustls = "0.23"
+serde = { version = "1.0.164", features = ["derive", "rc"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2.0.16"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1.40"
+x509-parser = "0.16"

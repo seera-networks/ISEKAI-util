@@ -1,0 +1,8 @@
+/target
+Cargo.lock
+
+# Key material must never be committed (see `secure_fs`).
+*.pem
+*.key
+*.p12
+*.pfx
