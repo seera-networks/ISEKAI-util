@@ -262,7 +262,47 @@ async fn ensure_certificate_dns01(
     cloudflare_zone_id: &str,
 ) -> anyhow::Result<()> {
     let client = Client::new();
+    let mut record_ids = Vec::new();
 
+    let outcome = dns01_challenges(
+        order,
+        &client,
+        cloudflare_api_token,
+        cloudflare_zone_id,
+        &mut record_ids,
+    )
+    .await;
+
+    // Only now, once the order has stopped being pending. `set_ready` merely
+    // asks the ACME server to validate; it queries `_acme-challenge` afterwards,
+    // on its own schedule. Deleting the record before that query lands makes the
+    // authorization — and so the order — Invalid, intermittently and for no
+    // visible reason.
+    for record_id in &record_ids {
+        if let Err(err) = client
+            .delete(format!(
+                "https://api.cloudflare.com/client/v4/zones/{cloudflare_zone_id}/dns_records/{record_id}"
+            ))
+            .bearer_auth(cloudflare_api_token)
+            .send()
+            .await
+        {
+            tracing::warn!("failed to delete Cloudflare TXT challenge record {record_id}: {err}");
+        }
+    }
+
+    outcome
+}
+
+/// Publish and validate the DNS-01 challenges, collecting the created record ids
+/// into `record_ids` for the caller to clean up.
+async fn dns01_challenges(
+    order: &mut instant_acme::Order,
+    client: &Client,
+    cloudflare_api_token: &str,
+    cloudflare_zone_id: &str,
+    record_ids: &mut Vec<String>,
+) -> anyhow::Result<()> {
     let mut authorizations = order.authorizations();
 
     while let Some(result) = authorizations.next().await {
@@ -326,7 +366,9 @@ async fn ensure_certificate_dns01(
             dns_value
         );
 
-        let record_id = create_resp.result.map(|v| v.id);
+        if let Some(record) = create_resp.result {
+            record_ids.push(record.id);
+        }
         let expected_dns_value = dns_value.clone();
         let mut propagated = false;
         for _ in 0..DNS_PROPAGATION_RETRY_COUNT {
@@ -354,17 +396,6 @@ async fn ensure_certificate_dns01(
             tokio::time::sleep(DNS_PROPAGATION_RETRY_INTERVAL).await;
         }
         if !propagated {
-            if let Some(record_id) = record_id
-                && let Err(err) = client
-                    .delete(format!(
-                        "https://api.cloudflare.com/client/v4/zones/{cloudflare_zone_id}/dns_records/{record_id}"
-                    ))
-                    .bearer_auth(cloudflare_api_token)
-                    .send()
-                    .await
-            {
-                tracing::warn!("failed to delete Cloudflare TXT challenge record: {err}");
-            }
             bail!(
                 "dns challenge did not propagate in time for {}",
                 challenge.identifier()
@@ -372,18 +403,6 @@ async fn ensure_certificate_dns01(
         }
 
         challenge.set_ready().await?;
-
-        if let Some(record_id) = record_id
-            && let Err(err) = client
-                .delete(format!(
-                    "https://api.cloudflare.com/client/v4/zones/{cloudflare_zone_id}/dns_records/{record_id}"
-                ))
-                .bearer_auth(cloudflare_api_token)
-                .send()
-                .await
-        {
-            tracing::warn!("failed to delete Cloudflare TXT challenge record: {err}");
-        }
     }
 
     let status = order.poll_ready(&RetryPolicy::default()).await?;
