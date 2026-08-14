@@ -102,12 +102,17 @@ pub struct AcmeCsrConfig {
     /// When empty, they are derived from the CSR's subjectAltName extension,
     /// which is the usual case: the ACME server requires the order and the CSR
     /// to name the same identifiers, so restating them here only adds a way for
-    /// the two to disagree. Set this to have the order deliberately name
-    /// something else — a mismatch is then caught locally, before the order is
+    /// the two to disagree. A mismatch is caught locally, before the order is
     /// spent, by [`instant_acme::Order::validate_csr()`].
     ///
+    /// This is **not** an allow-list and cannot be used as one: naming a subset
+    /// of the CSR's identifiers does not narrow what is issued, it gets the CSR
+    /// rejected for asking for a name the order does not authorize. See
+    /// [`issue_certificate_with_csr()`] on vetting a CSR that came from
+    /// somewhere else.
+    ///
     /// An entry that parses as an IP address becomes an IP identifier; anything
-    /// else becomes a DNS identifier.
+    /// else becomes a DNS identifier, lowercased. Duplicates are dropped.
     pub hosts: Vec<String>,
     pub challenge: AcmeChallengeType,
     pub account_credential_path: Option<String>,
@@ -183,6 +188,7 @@ pub async fn ensure_certificate(config: AcmeConfig) -> anyhow::Result<()> {
     if config.hosts.is_empty() {
         return Ok(());
     }
+    check_challenge_config(&config.challenge)?;
 
     let account = build_account(
         &config.directory_url,
@@ -247,12 +253,28 @@ pub async fn ensure_certificate(config: AcmeConfig) -> anyhow::Result<()> {
 ///
 /// Use [`ensure_certificate()`] instead when this process should generate the
 /// key pair itself.
+///
+/// # Vetting the names
+///
+/// The CSR decides what the certificate is for. With `hosts` empty the order is
+/// built from the CSR's own subjectAltName values, so
+/// [`instant_acme::Order::validate_csr()`] compares the CSR against an order
+/// derived from that same CSR and can never disagree with it. Whoever hands
+/// over the CSR is therefore asking for any name these ACME credentials can
+/// pass validation for — over DNS-01 with a zone-wide Cloudflare token, that is
+/// every name in the zone.
+///
+/// Check the CSR's names against what the requester is entitled to before
+/// calling this. [`AcmeCsrConfig::hosts`] cannot do it for you.
 pub async fn issue_certificate_with_csr(config: AcmeCsrConfig) -> anyhow::Result<String> {
-    let csr = config.csr.load()?;
+    // Before an order exists to be spent on it: a challenge that cannot work
+    // fails the same way on every retry, taking an order with it each time.
+    check_challenge_config(&config.challenge)?;
 
+    let csr = config.csr.load()?;
     let identifiers = match config.hosts.is_empty() {
         true => identifiers_from_csr(&csr)?,
-        false => config.hosts.iter().map(|host| identifier(host)).collect(),
+        false => identifiers_from_hosts(&config.hosts),
     };
 
     let account = build_account(
@@ -268,7 +290,7 @@ pub async fn issue_certificate_with_csr(config: AcmeCsrConfig) -> anyhow::Result
     order
         .validate_csr(&csr)
         .await
-        .context("the supplied CSR does not match the ACME order")?;
+        .context("failed to check the supplied CSR against the ACME order")?;
 
     if order.state().status == OrderStatus::Pending {
         solve_challenges(&mut order, &config.challenge).await?;
@@ -286,8 +308,7 @@ pub async fn issue_certificate_with_csr(config: AcmeCsrConfig) -> anyhow::Result
 
 /// The identifiers a CSR asks for, taken from its subjectAltName extension.
 ///
-/// Duplicates are dropped, keeping the first occurrence, because an ACME server
-/// rejects an order that names the same identifier twice.
+/// Duplicates are dropped, keeping the first occurrence; see [`push_unique()`].
 fn identifiers_from_csr(csr: &Csr<'_>) -> anyhow::Result<Vec<Identifier>> {
     let (rest, request) = X509CertificationRequest::from_der(csr.der())
         .map_err(|err| anyhow::anyhow!("failed to parse the CSR: {err}"))?;
@@ -303,7 +324,7 @@ fn identifiers_from_csr(csr: &Csr<'_>) -> anyhow::Result<Vec<Identifier>> {
 
         for name in &san.general_names {
             let identifier = match name {
-                GeneralName::DNSName(name) => Identifier::Dns((*name).to_owned()),
+                GeneralName::DNSName(name) => Identifier::Dns(name.to_ascii_lowercase()),
                 GeneralName::IPAddress(bytes) => match <[u8; 4]>::try_from(*bytes) {
                     Ok(octets) => Identifier::Ip(IpAddr::from(octets)),
                     Err(_) => match <[u8; 16]>::try_from(*bytes) {
@@ -316,27 +337,49 @@ fn identifiers_from_csr(csr: &Csr<'_>) -> anyhow::Result<Vec<Identifier>> {
                 // `Order::validate_csr()` reports it against the order.
                 _ => continue,
             };
-            if !identifiers.contains(&identifier) {
-                identifiers.push(identifier);
-            }
+            push_unique(&mut identifiers, identifier);
         }
     }
 
     if identifiers.is_empty() {
         bail!(
-            "the CSR has no DNS name or IP address in its subjectAltName extension; \
-             set `hosts` explicitly to order for other identifiers"
+            "the CSR has no DNS name or IP address in its subjectAltName extension, \
+             so there is nothing to order a certificate for"
         );
     }
     Ok(identifiers)
 }
 
-/// The ACME identifier for a configured host: an IP address literal becomes an
-/// IP identifier, anything else a DNS identifier.
+/// The identifiers for the configured hosts, deduplicated.
+fn identifiers_from_hosts(hosts: &[String]) -> Vec<Identifier> {
+    let mut identifiers = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        push_unique(&mut identifiers, identifier(host));
+    }
+    identifiers
+}
+
+/// The ACME identifier for a host: an IP address literal becomes an IP
+/// identifier, anything else a DNS identifier.
 fn identifier(host: &str) -> Identifier {
     match host.parse::<IpAddr>() {
         Ok(addr) => Identifier::Ip(addr),
-        Err(_) => Identifier::Dns(host.to_owned()),
+        // DNS names are matched case-insensitively by the CA, so fold the case
+        // here — otherwise `push_unique()` sees two spellings as two names.
+        Err(_) => Identifier::Dns(host.to_ascii_lowercase()),
+    }
+}
+
+/// Append `identifier` unless the list already has it.
+///
+/// An ACME server rejects an order that names the same identifier twice, and
+/// two spellings of one name are one identifier to it: `Example.COM` and
+/// `example.com`, or `2001:db8::1` and `2001:0db8:0000::0001`. Both are already
+/// normalized by the time they get here — DNS names lowercased, IP addresses
+/// parsed into an [`IpAddr`] — so plain equality is enough.
+fn push_unique(identifiers: &mut Vec<Identifier>, identifier: Identifier) {
+    if !identifiers.contains(&identifier) {
+        identifiers.push(identifier);
     }
 }
 
@@ -439,21 +482,31 @@ async fn new_order(
 /// Answer every pending authorization on `order` with the configured challenge
 /// type, leaving the order ready to be finalized.
 async fn solve_challenges(order: &mut Order, challenge: &AcmeChallengeType) -> anyhow::Result<()> {
+    check_challenge_config(challenge)?;
     match challenge {
         AcmeChallengeType::Dns01 {
             cloudflare_api_token,
             cloudflare_zone_id,
-        } => {
-            if cloudflare_api_token.is_empty() || cloudflare_zone_id.is_empty() {
-                bail!(
-                    "ACME DNS-01 challenge selected but Cloudflare token/zone id is not configured"
-                );
-            }
-            ensure_certificate_dns01(order, cloudflare_api_token, cloudflare_zone_id).await
-        }
+        } => ensure_certificate_dns01(order, cloudflare_api_token, cloudflare_zone_id).await,
         AcmeChallengeType::Http01 { bind_addr } => {
             ensure_certificate_http01(order, bind_addr).await
         }
+    }
+}
+
+/// Reject a challenge configuration that cannot work.
+///
+/// Worth doing before an order is created: the order is spent either way, and
+/// a missing credential fails identically on every retry.
+fn check_challenge_config(challenge: &AcmeChallengeType) -> anyhow::Result<()> {
+    match challenge {
+        AcmeChallengeType::Dns01 {
+            cloudflare_api_token,
+            cloudflare_zone_id,
+        } if cloudflare_api_token.is_empty() || cloudflare_zone_id.is_empty() => {
+            bail!("ACME DNS-01 challenge selected but Cloudflare token/zone id is not configured")
+        }
+        _ => Ok(()),
     }
 }
 
@@ -776,20 +829,71 @@ mod tests {
 
     #[test]
     fn csr_identifiers_are_deduplicated() {
-        // Repeating an identifier in an order gets it rejected by the server.
+        // Repeating an identifier in an order gets it rejected by the server,
+        // and a DNS name repeated in another case is the same identifier.
         assert_eq!(
-            identifiers(&["example.com", "example.com"], &["192.0.2.1", "192.0.2.1"]).unwrap(),
+            identifiers(
+                &["example.com", "example.com", "Example.COM"],
+                &[
+                    "192.0.2.1",
+                    "192.0.2.1",
+                    "2001:db8::1",
+                    "2001:0db8:0000::0001"
+                ],
+            )
+            .unwrap(),
             vec![
                 Identifier::Dns("example.com".to_owned()),
                 Identifier::Ip("192.0.2.1".parse().unwrap()),
+                Identifier::Ip("2001:db8::1".parse().unwrap()),
             ]
+        );
+    }
+
+    #[test]
+    fn host_identifiers_are_normalized_and_deduplicated() {
+        let hosts = [
+            "Example.COM",
+            "example.com",
+            "2001:db8::1",
+            "2001:0db8:0000::0001",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            identifiers_from_hosts(&hosts),
+            vec![
+                Identifier::Dns("example.com".to_owned()),
+                Identifier::Ip("2001:db8::1".parse().unwrap()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dns01_without_cloudflare_credentials_is_rejected() {
+        let missing = AcmeChallengeType::Dns01 {
+            cloudflare_api_token: String::new(),
+            cloudflare_zone_id: "zone".to_owned(),
+        };
+        let err = check_challenge_config(&missing).unwrap_err().to_string();
+        assert!(err.contains("Cloudflare token/zone id"), "{err}");
+
+        let configured = AcmeChallengeType::Dns01 {
+            cloudflare_api_token: "token".to_owned(),
+            cloudflare_zone_id: "zone".to_owned(),
+        };
+        assert!(check_challenge_config(&configured).is_ok());
+        assert!(
+            check_challenge_config(&AcmeChallengeType::Http01 {
+                bind_addr: "0.0.0.0:80".to_owned(),
+            })
+            .is_ok()
         );
     }
 
     #[test]
     fn csr_without_subject_alt_name_is_rejected() {
         let err = identifiers(&[], &[]).unwrap_err().to_string();
-        assert!(err.contains("subjectAltName"), "{err}");
+        assert!(err.contains("nothing to order a certificate for"), "{err}");
     }
 
     #[test]
