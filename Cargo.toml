@@ -8,14 +8,18 @@ repository = "https://github.com/seera-networks/ISEKAI-util"
 # Versions are written out here rather than inherited from a workspace: this
 # crate is consumed as a git dependency by ISEKAI-link-server, so it has to
 # resolve on its own. `instant-acme` stays a git dependency pinned to an exact
-# rev, matching the consumer's `deny.toml` allow-git policy.
+# rev, matching the consumer's `deny.toml` allow-git policy — note the source is
+# our fork, which adds the `Csr` / `Order::finalize_with()` / `validate_csr()`
+# APIs that `acme::issue_certificate_with_csr()` needs. The `x509-parser`
+# feature is what turns on `validate_csr()`; `fs` is what lets a CSR be read
+# from a file path.
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 base64 = "0.22.1"
 hickory-net = "0.26.1"
 hickory-resolver = "0.26.1"
-instant-acme = { git = "https://github.com/djc/instant-acme.git", rev = "fad75fa7f1f4bf6a295fd2cea13078bab85378a8" }
+instant-acme = { git = "https://github.com/seera-networks/instant-acme.git", rev = "52bbb45e0b7b987cf12871ecbdf000d8479d96ef", features = ["fs", "x509-parser"] }
 openssl = { version = "0.10", default-features = false }
 # ECDSA P-256 / JWK for Endpoint PoP verification (P2P Connect).
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "jwk", "std"] }
@@ -28,4 +32,4 @@ thiserror = "2.0.16"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1.40"
-x509-parser = "0.16"
+x509-parser = "0.18"
