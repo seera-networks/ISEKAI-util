@@ -12,6 +12,10 @@ that the server and other consumers can depend on one copy.
   writes cert / key / PKCS#12, while `issue_certificate_with_csr()` signs a CSR
   the caller supplies and returns the chain — that path never sees the
   certificate's private key, so there is no key or PKCS#12 to write.
+  The DNS-01 challenge takes a `Dns01Propagation` mode: `Poll` (the default)
+  queries the zone's authoritative name servers until the TXT record shows up,
+  which needs outbound port 53; `Wait(duration)` sleeps for a fixed period
+  instead, for environments where that port is blocked.
 - `dns.rs` — DNS resolution ([hickory](https://github.com/hickory-dns/hickory-dns)).
 - `secure_fs.rs` — hardened file I/O; enforces `0600` permissions on key material.
 - `pop.rs` — P2P Connect Proof-of-Possession primitives: RFC 7638 JWK thumbprints,

@@ -31,6 +31,49 @@ use x509_parser::{
 const DNS_PROPAGATION_RETRY_COUNT: usize = 30;
 const DNS_PROPAGATION_RETRY_INTERVAL: Duration = Duration::from_secs(6);
 
+/// How long [`Dns01Propagation::Wait`] sleeps unless told otherwise.
+///
+/// Two minutes is a heuristic with slack in it: what it has to cover is the
+/// time Cloudflare — the provider these records are published through — takes
+/// to serve a newly created record from every authoritative server, which is
+/// normally seconds.
+///
+/// It deliberately does not try to cover negative caching, and no value that
+/// anyone would want to wait for could. Once a resolver the CA validates
+/// through has asked for the `_acme-challenge` name and been told it does not
+/// exist — a previous failed attempt is the usual way that happens — it may
+/// serve that answer from cache until the zone's SOA minimum expires, 30
+/// minutes on Cloudflare, however long ago the record was published. `Wait`
+/// queries nothing and so cannot notice; the authorization simply comes back
+/// invalid. Retry after the SOA minimum, or use [`Dns01Propagation::Poll`]
+/// where port 53 is reachable — it asks the authoritative servers directly and
+/// no cache stands in the way.
+pub const DEFAULT_DNS_PROPAGATION_WAIT: Duration = Duration::from_secs(120);
+
+/// How to establish that a published DNS-01 TXT record is visible before asking
+/// the ACME server to validate it.
+#[derive(Clone, Debug, Default)]
+pub enum Dns01Propagation {
+    /// Query the zone's authoritative name servers until the record shows up,
+    /// then proceed as soon as it does.
+    ///
+    /// This needs outbound UDP/TCP port 53 to those servers. Where that is
+    /// blocked — a container with egress rules, a network that only permits a
+    /// local recursive resolver — every lookup fails and the challenge is
+    /// abandoned even though the record was published fine. Use
+    /// [`Wait`](Self::Wait) there.
+    #[default]
+    Poll,
+    /// Sleep for a fixed period after publishing the record, then proceed
+    /// without checking anything.
+    ///
+    /// Nothing is queried, so no port 53 access is required. The trade-off is
+    /// that the wait is always paid in full, and a record that has genuinely
+    /// not propagated is only found out about when the ACME server reports the
+    /// authorization invalid.
+    Wait(Duration),
+}
+
 /// Challenge method used for ACME domain validation.
 #[derive(Clone, Debug)]
 pub enum AcmeChallengeType {
@@ -38,6 +81,10 @@ pub enum AcmeChallengeType {
     Dns01 {
         cloudflare_api_token: String,
         cloudflare_zone_id: String,
+        /// How to wait for the published TXT record before handing the
+        /// challenge to the ACME server. See [`Dns01Propagation`];
+        /// [`Dns01Propagation::Poll`] is the default.
+        propagation: Dns01Propagation,
     },
     /// HTTP-01 challenge served by a temporary HTTP server.
     Http01 {
@@ -487,7 +534,11 @@ async fn solve_challenges(order: &mut Order, challenge: &AcmeChallengeType) -> a
         AcmeChallengeType::Dns01 {
             cloudflare_api_token,
             cloudflare_zone_id,
-        } => ensure_certificate_dns01(order, cloudflare_api_token, cloudflare_zone_id).await,
+            propagation,
+        } => {
+            ensure_certificate_dns01(order, cloudflare_api_token, cloudflare_zone_id, propagation)
+                .await
+        }
         AcmeChallengeType::Http01 { bind_addr } => {
             ensure_certificate_http01(order, bind_addr).await
         }
@@ -503,6 +554,7 @@ fn check_challenge_config(challenge: &AcmeChallengeType) -> anyhow::Result<()> {
         AcmeChallengeType::Dns01 {
             cloudflare_api_token,
             cloudflare_zone_id,
+            ..
         } if cloudflare_api_token.is_empty() || cloudflare_zone_id.is_empty() => {
             bail!("ACME DNS-01 challenge selected but Cloudflare token/zone id is not configured")
         }
@@ -516,6 +568,7 @@ async fn ensure_certificate_dns01(
     order: &mut instant_acme::Order,
     cloudflare_api_token: &str,
     cloudflare_zone_id: &str,
+    propagation: &Dns01Propagation,
 ) -> anyhow::Result<()> {
     let client = Client::new();
     let mut record_ids = Vec::new();
@@ -525,6 +578,7 @@ async fn ensure_certificate_dns01(
         &client,
         cloudflare_api_token,
         cloudflare_zone_id,
+        propagation,
         &mut record_ids,
     )
     .await;
@@ -557,10 +611,16 @@ async fn dns01_challenges(
     client: &Client,
     cloudflare_api_token: &str,
     cloudflare_zone_id: &str,
+    propagation: &Dns01Propagation,
     record_ids: &mut Vec<String>,
 ) -> anyhow::Result<()> {
+    // Every record is published before any of them is waited on: the records are
+    // independent, so they propagate concurrently, and one wait covers them all.
+    // Interleaving publish and wait would pay the wait once per authorization —
+    // for `Wait`, literally, since its delay is a fixed sleep rather than
+    // something that ends when the record shows up.
+    let mut published = Vec::new();
     let mut authorizations = order.authorizations();
-
     while let Some(result) = authorizations.next().await {
         let mut authorization = result?;
         match authorization.status {
@@ -569,95 +629,75 @@ async fn dns01_challenges(
             status => bail!("unsupported authorization status: {status:?}"),
         }
 
-        let mut challenge = authorization
+        let challenge = authorization
             .challenge(ChallengeType::Dns01)
             .ok_or_else(|| anyhow::anyhow!("dns-01 challenge not found"))?;
-        let dns_identifier = match challenge.identifier().identifier {
+        let identifier = match challenge.identifier().identifier {
             Identifier::Dns(dns) => dns.to_string(),
             _ => bail!("unsupported non-DNS identifier type for dns-01 challenge"),
         };
-        let ips = crate::dns::get_name_servers(&dns_identifier)
-            .await
-            .with_context(|| format!("failed to get NS servers for {}", challenge.identifier()))?;
+        let dns_name = format!("_acme-challenge.{identifier}");
+        let dns_value = challenge.key_authorization()?.dns_value().to_string();
 
-        let mut ns_configs = Vec::new();
-        for ip in ips {
-            tracing::debug!("querying ACME challenge propagation via NS server {ip}");
-            let ns_config = NameServerConfig::udp_and_tcp(ip);
-            ns_configs.push(ns_config);
-        }
-        let resolver_config = ResolverConfig::from_parts(None, vec![], ns_configs);
-        let mut resolver_opts = ResolverOpts::default();
-        resolver_opts.negative_max_ttl = Some(std::time::Duration::from_secs(0));
-        let resolver = Resolver::builder_with_config(resolver_config, TokioRuntimeProvider::new())
-            .with_options(resolver_opts)
-            .build()?;
+        let record_id = publish_dns01_record(
+            client,
+            cloudflare_api_token,
+            cloudflare_zone_id,
+            &dns_name,
+            &dns_value,
+        )
+        .await
+        .with_context(|| {
+            format!("failed to publish the DNS-01 challenge record for {identifier}")
+        })?;
+        // Pushed before anything else can fail, so the caller tears the record
+        // down even if a later authorization gives up.
+        record_ids.extend(record_id);
 
-        let dns_name = format!("_acme-challenge.{dns_identifier}");
-        let key_authorization = challenge.key_authorization()?;
-        let dns_value = key_authorization.dns_value().to_string();
-        let create_resp = client
-            .post(format!(
-                "https://api.cloudflare.com/client/v4/zones/{cloudflare_zone_id}/dns_records"
-            ))
-            .bearer_auth(cloudflare_api_token)
-            .json(&json!({
-                "type": "TXT",
-                "name": dns_name,
-                "content": format!("\"{}\"", dns_value),
-                "ttl": 120,
-                "proxied": false
-            }))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<CloudflareCreateRecordResponse>()
-            .await?;
-        if !create_resp.success {
-            bail!("failed to create Cloudflare TXT record");
-        }
-        tracing::debug!(
-            "created Cloudflare TXT record for {} with value {}",
+        published.push(PublishedDns01 {
+            identifier,
             dns_name,
-            dns_value
-        );
+            dns_value,
+        });
+    }
 
-        if let Some(record) = create_resp.result {
-            record_ids.push(record.id);
-        }
-        let expected_dns_value = dns_value.clone();
-        let mut propagated = false;
-        for _ in 0..DNS_PROPAGATION_RETRY_COUNT {
-            let lookup = resolver
-                .lookup(format!("{dns_name}."), RecordType::TXT)
-                .await;
-            if let Ok(lookup) = lookup
-                && lookup
-                    .answers()
-                    .iter()
-                    .any(|txt| txt.to_string().contains(&expected_dns_value))
-            {
-                tracing::debug!(
-                    "DNS-01 challenge for {} successfully propagated with value {}",
-                    challenge.identifier(),
-                    dns_value
-                );
-                propagated = true;
-                break;
+    match propagation {
+        Dns01Propagation::Poll => {
+            for record in &published {
+                poll_dns01_propagation(&record.identifier, &record.dns_name, &record.dns_value)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to confirm the DNS-01 challenge record for {}",
+                            record.identifier
+                        )
+                    })?;
             }
-            tracing::debug!(
-                "DNS-01 challenge for {} not propagated yet, retrying...",
-                challenge.identifier()
-            );
-            tokio::time::sleep(DNS_PROPAGATION_RETRY_INTERVAL).await;
         }
-        if !propagated {
-            bail!(
-                "dns challenge did not propagate in time for {}",
-                challenge.identifier()
+        // Nothing was published, so there is nothing to wait for: every
+        // authorization was already valid.
+        Dns01Propagation::Wait(_) if published.is_empty() => {}
+        Dns01Propagation::Wait(delay) => {
+            tracing::info!(
+                "waiting {delay:?} for {} DNS-01 challenge record(s) to propagate",
+                published.len()
             );
+            tokio::time::sleep(*delay).await;
         }
+    }
 
+    // A second pass over the same authorizations: the handles borrow the stream,
+    // so they cannot be held across iterations to be set ready later. Their state
+    // is already fetched, so this costs no further requests.
+    let mut authorizations = order.authorizations();
+    while let Some(result) = authorizations.next().await {
+        let mut authorization = result?;
+        if authorization.status != AuthorizationStatus::Pending {
+            continue;
+        }
+        let mut challenge = authorization
+            .challenge(ChallengeType::Dns01)
+            .ok_or_else(|| anyhow::anyhow!("dns-01 challenge not found"))?;
         challenge.set_ready().await?;
     }
 
@@ -666,6 +706,112 @@ async fn dns01_challenges(
         bail!("unexpected order status after dns-01 challenges: {status:?}");
     }
     Ok(())
+}
+
+/// A published DNS-01 challenge record, waiting to be picked up by the zone's
+/// name servers.
+struct PublishedDns01 {
+    /// The identifier being authorized, e.g. `example.com`.
+    identifier: String,
+    /// The record's own name, `_acme-challenge.<identifier>`.
+    dns_name: String,
+    /// The value it was published with.
+    dns_value: String,
+}
+
+/// Create the TXT record at `dns_name` holding `dns_value`, returning the id
+/// Cloudflare assigned it (when it reported one) so it can be deleted later.
+async fn publish_dns01_record(
+    client: &Client,
+    cloudflare_api_token: &str,
+    cloudflare_zone_id: &str,
+    dns_name: &str,
+    dns_value: &str,
+) -> anyhow::Result<Option<String>> {
+    let create_resp = client
+        .post(format!(
+            "https://api.cloudflare.com/client/v4/zones/{cloudflare_zone_id}/dns_records"
+        ))
+        .bearer_auth(cloudflare_api_token)
+        .json(&json!({
+            "type": "TXT",
+            "name": dns_name,
+            "content": format!("\"{}\"", dns_value),
+            "ttl": 120,
+            "proxied": false
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<CloudflareCreateRecordResponse>()
+        .await?;
+    if !create_resp.success {
+        bail!("failed to create Cloudflare TXT record");
+    }
+    tracing::debug!("created Cloudflare TXT record for {dns_name} with value {dns_value}");
+
+    Ok(create_resp.result.map(|record| record.id))
+}
+
+/// Query the authoritative name servers of `dns_identifier` until the TXT record
+/// at `dns_name` carries `dns_value`.
+///
+/// Every query goes straight to those servers over port 53, bypassing any
+/// recursive resolver and its caching. Where that port is blocked, no lookup can
+/// ever succeed — see [`Dns01Propagation::Wait`].
+async fn poll_dns01_propagation(
+    dns_identifier: &str,
+    dns_name: &str,
+    dns_value: &str,
+) -> anyhow::Result<()> {
+    let ips = crate::dns::get_name_servers(dns_identifier)
+        .await
+        .with_context(|| format!("failed to get NS servers for {dns_identifier}"))?;
+    // `get_name_servers()` reports "none found" as an empty list, and it goes
+    // over port 53 itself, so this is what a blocked port looks like from here.
+    // Without the check, the resolver below has nothing to query and every
+    // lookup fails until the retries run out — reported as a record that never
+    // propagated, which sends the reader after the wrong problem entirely.
+    if ips.is_empty() {
+        bail!(
+            "found no authoritative name server for {dns_identifier} to check the DNS-01 \
+             challenge record against"
+        );
+    }
+
+    let mut ns_configs = Vec::new();
+    for ip in ips {
+        tracing::debug!("querying ACME challenge propagation via NS server {ip}");
+        let ns_config = NameServerConfig::udp_and_tcp(ip);
+        ns_configs.push(ns_config);
+    }
+    let resolver_config = ResolverConfig::from_parts(None, vec![], ns_configs);
+    let mut resolver_opts = ResolverOpts::default();
+    resolver_opts.negative_max_ttl = Some(Duration::from_secs(0));
+    let resolver = Resolver::builder_with_config(resolver_config, TokioRuntimeProvider::new())
+        .with_options(resolver_opts)
+        .build()?;
+
+    for _ in 0..DNS_PROPAGATION_RETRY_COUNT {
+        let lookup = resolver
+            .lookup(format!("{dns_name}."), RecordType::TXT)
+            .await;
+        if let Ok(lookup) = lookup
+            && lookup
+                .answers()
+                .iter()
+                .any(|txt| txt.to_string().contains(dns_value))
+        {
+            tracing::debug!(
+                "DNS-01 challenge for {dns_identifier} successfully propagated with value {dns_value}"
+            );
+            return Ok(());
+        }
+        tracing::debug!("DNS-01 challenge for {dns_identifier} not propagated yet, retrying...");
+        tokio::time::sleep(DNS_PROPAGATION_RETRY_INTERVAL).await;
+    }
+
+    bail!("dns challenge did not propagate in time for {dns_identifier}")
 }
 
 /// Handle ACME HTTP-01 challenges for all pending authorizations by running a
@@ -873,13 +1019,27 @@ mod tests {
         let missing = AcmeChallengeType::Dns01 {
             cloudflare_api_token: String::new(),
             cloudflare_zone_id: "zone".to_owned(),
+            propagation: Dns01Propagation::default(),
         };
         let err = check_challenge_config(&missing).unwrap_err().to_string();
+        assert!(err.contains("Cloudflare token/zone id"), "{err}");
+
+        // The propagation mode has no bearing on whether the credentials are
+        // usable, so a fixed wait is checked the same way.
+        let missing_zone = AcmeChallengeType::Dns01 {
+            cloudflare_api_token: "token".to_owned(),
+            cloudflare_zone_id: String::new(),
+            propagation: Dns01Propagation::Wait(DEFAULT_DNS_PROPAGATION_WAIT),
+        };
+        let err = check_challenge_config(&missing_zone)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Cloudflare token/zone id"), "{err}");
 
         let configured = AcmeChallengeType::Dns01 {
             cloudflare_api_token: "token".to_owned(),
             cloudflare_zone_id: "zone".to_owned(),
+            propagation: Dns01Propagation::Wait(Duration::from_secs(30)),
         };
         assert!(check_challenge_config(&configured).is_ok());
         assert!(
@@ -928,6 +1088,16 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dns01_propagation_defaults_to_polling() {
+        // Existing callers that do not name a mode keep the behaviour they had
+        // before the option existed.
+        assert!(matches!(
+            Dns01Propagation::default(),
+            Dns01Propagation::Poll
+        ));
     }
 
     #[test]
