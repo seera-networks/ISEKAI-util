@@ -23,7 +23,10 @@ instant-acme = { git = "https://github.com/seera-networks/instant-acme.git", rev
 openssl = { version = "0.10", default-features = false }
 # ECDSA P-256 / JWK for Endpoint PoP verification (P2P Connect).
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "jwk", "std"] }
-reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
+# `query` is for the Cloudflare record lookup in `dns::delete_host_record`:
+# the name goes in a query parameter, and encoding it by hand would be correct
+# only for the hosts we happen to pass today.
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "query", "rustls"] }
 rustls = "0.23"
 serde = { version = "1.0.164", features = ["derive", "rc"] }
 serde_json = "1"
